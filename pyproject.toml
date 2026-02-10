@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-serving"
+version = "0.1.0"
+description = "Minimal-budget LLM serving stack with voice and search"
+requires-python = ">=3.11"
+dependencies = [
+    # API & Server
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "websockets>=14.0",
+    # Local inference
+    "llama-cpp-python>=0.3.0",
+    # Config
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    # Cache
+    "cachetools>=5.5.0",
+    # Metrics
+    "prometheus-client>=0.21.0",
+    # Logging
+    "structlog>=24.4.0",
+    # Vector search
+    "numpy>=1.26.0",
+    # Audio (STT/TTS)
+    "openai-whisper>=20240930; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "httpx",  # for TestClient
+]
+faiss = [
+    "faiss-cpu>=1.9.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
