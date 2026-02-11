@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -11,7 +12,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from src.config import Settings, get_settings
+from src.core.rag import RAGPipeline
 from src.core.router import ModelRouter
+from src.store.vector import VectorStore, create_vector_store
 
 logger = structlog.get_logger()
 
@@ -19,6 +22,8 @@ logger = structlog.get_logger()
 
 _startup_time: float = 0.0
 _model_router: ModelRouter | None = None
+_vector_store: VectorStore | None = None
+_rag_pipeline: RAGPipeline | None = None
 
 
 def get_router() -> ModelRouter:
@@ -28,12 +33,19 @@ def get_router() -> ModelRouter:
     return _model_router
 
 
+def get_rag_pipeline() -> RAGPipeline:
+    """Return the initialised RAG pipeline. Raises if called before startup."""
+    if _rag_pipeline is None:
+        raise RuntimeError("RAGPipeline not initialised – app not started")
+    return _rag_pipeline
+
+
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the application."""
-    global _startup_time, _model_router
+    global _startup_time, _model_router, _vector_store, _rag_pipeline
 
     settings: Settings = get_settings()
     _startup_time = time.time()
@@ -41,13 +53,29 @@ async def lifespan(app: FastAPI):
     # Initialise model router (registers providers, loads local models)
     _model_router = ModelRouter(settings)
     await _model_router.startup()
-    logger.info("app.started", models=len(settings.models))
+
+    # Initialise vector store and RAG pipeline
+    persist_dir = Path(settings.vector_store.persist_dir) if settings.vector_store.persist_dir else None
+    _vector_store = create_vector_store(
+        backend=settings.vector_store.backend,
+        persist_dir=persist_dir,
+        dimension=settings.vector_store.dimension,
+    )
+    await _vector_store.load()
+    _rag_pipeline = RAGPipeline(router=_model_router, vector_store=_vector_store)
+
+    logger.info("app.started", models=len(settings.models), vector_backend=settings.vector_store.backend)
 
     yield
 
-    # Shutdown
+    # Persist vector store before shutdown
+    if _vector_store:
+        await _vector_store.persist()
+
     await _model_router.shutdown()
     _model_router = None
+    _vector_store = None
+    _rag_pipeline = None
     logger.info("app.stopped")
 
 
@@ -95,8 +123,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ── Register routers ────────────────────────────────────────────────
 
     from src.api.chat import router as chat_router
+    from src.api.embeddings import router as embeddings_router
+    from src.api.search import router as search_router
 
     app.include_router(chat_router, prefix="/v1")
+    app.include_router(embeddings_router, prefix="/v1")
+    app.include_router(search_router, prefix="/v1")
 
     return app
 

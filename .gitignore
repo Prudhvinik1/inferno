@@ -44,3 +44,7 @@ logs/
 # Distribution
 *.whl
 *.tar.gz
+
+# Cursor
+.cursor/
+plan.md
