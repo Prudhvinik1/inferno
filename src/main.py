@@ -86,6 +86,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
+    # ── Error handlers ──────────────────────────────────────────────────
+
+    from src.infra.error_handler import install_error_handlers
+
+    install_error_handlers(app)
+
     # ── Register routers ────────────────────────────────────────────────
 
     from src.api.chat import router as chat_router

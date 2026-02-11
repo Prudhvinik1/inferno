@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 
 from src.config import ModelConfig, Settings
+from src.core.exceptions import ModelNotFoundError, ProviderError
 from src.core.provider import Provider
 from src.core.schemas import (
     ChatRequest,
@@ -25,24 +26,6 @@ from src.core.schemas import (
 logger = structlog.get_logger()
 
 MAX_FALLBACK_DEPTH = 5
-
-
-class ModelNotFoundError(Exception):
-    """Raised when a requested model is not in the registry."""
-
-    def __init__(self, model: str, available: list[str]) -> None:
-        self.model = model
-        self.available = available
-        super().__init__(f"Model '{model}' not found. Available: {available}")
-
-
-class ProviderError(Exception):
-    """Raised when a provider fails and no fallback is available."""
-
-    def __init__(self, model: str, cause: Exception) -> None:
-        self.model = model
-        self.cause = cause
-        super().__init__(f"Provider failed for model '{model}': {cause}")
 
 
 class ModelRegistry:
@@ -216,7 +199,10 @@ class ModelRouter:
                     has_fallback=config.fallback_model is not None,
                 )
 
-        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
+        raise ProviderError(
+            message=f"All providers failed for model '{model_name}': {last_exc}",
+            provider=model_name,
+        )
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamChunk]:
         """Route a streaming chat request with fallback on failure.
@@ -255,7 +241,10 @@ class ModelRouter:
                     has_fallback=config.fallback_model is not None,
                 )
 
-        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
+        raise ProviderError(
+            message=f"All providers failed for model '{model_name}': {last_exc}",
+            provider=model_name,
+        )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         """Route an embedding request with fallback on failure."""
@@ -281,7 +270,10 @@ class ModelRouter:
                     has_fallback=config.fallback_model is not None,
                 )
 
-        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
+        raise ProviderError(
+            message=f"All providers failed for model '{model_name}': {last_exc}",
+            provider=model_name,
+        )
 
     # ── Provider factory ─────────────────────────────────────────────────
 

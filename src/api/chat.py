@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from src.core.router import ModelNotFoundError, ModelRouter
-from src.core.schemas import ChatRequest, ChatResponse, ErrorDetail, ErrorResponse
+from src.core.router import ModelRouter
+from src.core.schemas import ChatRequest, ChatResponse, ErrorResponse
 from src.main import get_router
 
 logger = structlog.get_logger()
@@ -21,8 +19,12 @@ router = APIRouter(tags=["chat"])
     "/chat/completions",
     response_model=ChatResponse,
     responses={
+        400: {"model": ErrorResponse, "description": "Invalid request"},
         404: {"model": ErrorResponse, "description": "Model not found"},
+        429: {"model": ErrorResponse, "description": "Rate limit exceeded"},
         500: {"model": ErrorResponse, "description": "Internal server error"},
+        502: {"model": ErrorResponse, "description": "Provider error"},
+        503: {"model": ErrorResponse, "description": "Model not loaded"},
     },
 )
 async def chat_completions(
@@ -34,42 +36,13 @@ async def chat_completions(
 
     Supports both streaming (SSE) and non-streaming responses,
     controlled by the ``stream`` field in the request body.
-    """
-    try:
-        if body.stream:
-            return _stream_response(body, request, model_router)
-        return await model_router.generate(body)
 
-    except ModelNotFoundError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=ErrorDetail(
-                message=str(exc),
-                type="invalid_request_error",
-                param="model",
-                code="model_not_found",
-            ).model_dump(),
-        ) from exc
-    except RuntimeError as exc:
-        # Covers "model not loaded" from LocalLLMProvider
-        raise HTTPException(
-            status_code=503,
-            detail=ErrorDetail(
-                message=str(exc),
-                type="server_error",
-                code="model_not_loaded",
-            ).model_dump(),
-        ) from exc
-    except Exception as exc:
-        logger.exception("chat.completions.error", model=body.model)
-        raise HTTPException(
-            status_code=500,
-            detail=ErrorDetail(
-                message="Internal server error",
-                type="server_error",
-                code="internal_error",
-            ).model_dump(),
-        ) from exc
+    Errors are caught by the global error handler middleware and
+    returned in the unified ErrorResponse format.
+    """
+    if body.stream:
+        return _stream_response(body, request, model_router)
+    return await model_router.generate(body)
 
 
 def _stream_response(
@@ -97,34 +70,16 @@ def _stream_response(
             # Send the [DONE] sentinel (OpenAI convention)
             yield "data: [DONE]\n\n"
 
-        except ModelNotFoundError as exc:
-            error = ErrorResponse(
-                error=ErrorDetail(
-                    message=str(exc),
-                    type="invalid_request_error",
-                    param="model",
-                    code="model_not_found",
-                )
-            )
-            yield f"data: {error.model_dump_json()}\n\n"
-
-        except RuntimeError as exc:
-            error = ErrorResponse(
-                error=ErrorDetail(
-                    message=str(exc),
-                    type="server_error",
-                    code="model_not_loaded",
-                )
-            )
-            yield f"data: {error.model_dump_json()}\n\n"
-
         except Exception as exc:
+            # For streaming, errors mid-stream are sent as SSE error events
+            from src.core.schemas import ErrorDetail, ErrorResponse as ErrResp
+
             logger.exception("chat.stream.error", model=body.model)
-            error = ErrorResponse(
+            error = ErrResp(
                 error=ErrorDetail(
-                    message="Internal server error during streaming",
+                    message=str(exc),
                     type="server_error",
-                    code="internal_error",
+                    code="stream_error",
                 )
             )
             yield f"data: {error.model_dump_json()}\n\n"
