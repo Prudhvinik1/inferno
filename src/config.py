@@ -102,9 +102,13 @@ class VectorStoreSettings(BaseSettings):
     backend: Literal["numpy", "faiss"] = Field(
         default="numpy", description="Vector store backend"
     )
-    persist_dir: Path = Field(
-        default=Path("data/vectors"),
-        description="Directory for persisting vector index",
+    persist_dir: str = Field(
+        default="data/vectors",
+        description="Directory for persisting vector index (empty string disables persistence)",
+    )
+    dimension: int = Field(
+        default=1536,
+        description="Embedding dimension (used to pre-allocate FAISS index)",
     )
     default_top_k: int = Field(default=5, description="Default number of results to return")
 
