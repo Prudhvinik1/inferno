@@ -31,6 +31,10 @@ class ModelConfig(BaseSettings):
         description="Provider-specific model identifier (e.g. GGUF path or API model name)"
     )
     is_default: bool = False
+    fallback_model: str | None = Field(
+        default=None,
+        description="Model name to fall back to if this provider fails",
+    )
 
 
 class LocalProviderSettings(BaseSettings):

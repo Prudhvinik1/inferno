@@ -1,7 +1,8 @@
 """Model router: registry + routing policy + provider lifecycle.
 
 The ModelRouter owns the mapping from model names to provider instances
-and handles request routing, alias resolution, and default model selection.
+and handles request routing, fallback on provider failure, and default
+model selection.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from src.core.schemas import (
 
 logger = structlog.get_logger()
 
+MAX_FALLBACK_DEPTH = 5
+
 
 class ModelNotFoundError(Exception):
     """Raised when a requested model is not in the registry."""
@@ -31,6 +34,15 @@ class ModelNotFoundError(Exception):
         self.model = model
         self.available = available
         super().__init__(f"Model '{model}' not found. Available: {available}")
+
+
+class ProviderError(Exception):
+    """Raised when a provider fails and no fallback is available."""
+
+    def __init__(self, model: str, cause: Exception) -> None:
+        self.model = model
+        self.cause = cause
+        super().__init__(f"Provider failed for model '{model}': {cause}")
 
 
 class ModelRegistry:
@@ -64,6 +76,7 @@ class ModelRegistry:
             provider=config.provider,
             model_id=config.model_id,
             is_default=config.is_default,
+            fallback=config.fallback_model,
         )
 
     def resolve(self, model_name: str) -> tuple[ModelConfig, Provider]:
@@ -74,7 +87,6 @@ class ModelRegistry:
         Raises:
             ModelNotFoundError: If model is not registered.
         """
-        # Use default if no model specified
         if not model_name and self._default_model:
             model_name = self._default_model
 
@@ -84,6 +96,28 @@ class ModelRegistry:
         config = self._entries[model_name]
         provider = self._providers[config.provider]
         return config, provider
+
+    def get_fallback_chain(self, model_name: str) -> list[tuple[ModelConfig, Provider]]:
+        """Build the ordered fallback chain for a model.
+
+        Returns a list of (config, provider) starting with the requested
+        model and continuing through each declared ``fallback_model``.
+        Stops at ``MAX_FALLBACK_DEPTH`` or if a cycle is detected.
+        """
+        chain: list[tuple[ModelConfig, Provider]] = []
+        seen: set[str] = set()
+        current = model_name
+
+        while current and current not in seen and len(chain) < MAX_FALLBACK_DEPTH:
+            if current not in self._entries:
+                break
+            seen.add(current)
+            config = self._entries[current]
+            provider = self._providers[config.provider]
+            chain.append((config, provider))
+            current = config.fallback_model  # type: ignore[assignment]
+
+        return chain
 
     @property
     def default_model(self) -> str | None:
@@ -105,7 +139,7 @@ class ModelRouter:
     Responsibilities:
         1. Build the model registry from settings.
         2. Instantiate and manage provider lifecycles.
-        3. Route requests based on model name.
+        3. Route requests based on model name with fallback on failure.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -144,25 +178,110 @@ class ModelRouter:
             except Exception:
                 logger.exception("router.provider_shutdown_error", provider=name)
 
-    # ── Routing ──────────────────────────────────────────────────────────
+    # ── Routing with fallback ────────────────────────────────────────────
+
+    def _resolve_model_name(self, model: str) -> str:
+        """Normalise model name, falling back to default when empty."""
+        if not model and self._registry.default_model:
+            return self._registry.default_model
+        return model
 
     async def generate(self, request: ChatRequest) -> ChatResponse:
-        """Route a non-streaming chat request to the appropriate provider."""
-        _config, provider = self._registry.resolve(request.model)
-        logger.debug("router.generate", model=request.model, provider=provider.provider_name)
-        return await provider.generate(request)
+        """Route a non-streaming chat request with fallback on failure."""
+        model_name = self._resolve_model_name(request.model)
+        chain = self._registry.get_fallback_chain(model_name)
+
+        if not chain:
+            raise ModelNotFoundError(model_name, self._registry.model_names)
+
+        last_exc: Exception | None = None
+        for config, provider in chain:
+            try:
+                routed = request.model_copy(update={"model": config.model_id})
+                logger.debug(
+                    "router.generate",
+                    model=config.name,
+                    provider=provider.provider_name,
+                    is_fallback=config.name != model_name,
+                )
+                response = await provider.generate(routed)
+                return response.model_copy(update={"model": config.name})
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "router.generate_failed",
+                    model=config.name,
+                    provider=provider.provider_name,
+                    error=str(exc),
+                    has_fallback=config.fallback_model is not None,
+                )
+
+        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamChunk]:
-        """Route a streaming chat request to the appropriate provider."""
-        _config, provider = self._registry.resolve(request.model)
-        logger.debug("router.stream", model=request.model, provider=provider.provider_name)
-        async for chunk in provider.stream(request):
-            yield chunk
+        """Route a streaming chat request with fallback on failure.
+
+        Fallback is attempted only if the provider raises before yielding
+        the first chunk. Once streaming has started, errors propagate
+        directly to the caller.
+        """
+        model_name = self._resolve_model_name(request.model)
+        chain = self._registry.get_fallback_chain(model_name)
+
+        if not chain:
+            raise ModelNotFoundError(model_name, self._registry.model_names)
+
+        last_exc: Exception | None = None
+        for config, provider in chain:
+            try:
+                routed = request.model_copy(update={"model": config.model_id})
+                logger.debug(
+                    "router.stream",
+                    model=config.name,
+                    provider=provider.provider_name,
+                    is_fallback=config.name != model_name,
+                )
+                async for chunk in provider.stream(routed):
+                    yield chunk.model_copy(update={"model": config.name})
+                # Stream completed successfully — stop fallback chain.
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "router.stream_failed",
+                    model=config.name,
+                    provider=provider.provider_name,
+                    error=str(exc),
+                    has_fallback=config.fallback_model is not None,
+                )
+
+        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
-        """Route an embedding request to the appropriate provider."""
-        _config, provider = self._registry.resolve(request.model)
-        return await provider.embed(request)
+        """Route an embedding request with fallback on failure."""
+        model_name = self._resolve_model_name(request.model)
+        chain = self._registry.get_fallback_chain(model_name)
+
+        if not chain:
+            raise ModelNotFoundError(model_name, self._registry.model_names)
+
+        last_exc: Exception | None = None
+        for config, provider in chain:
+            try:
+                routed = request.model_copy(update={"model": config.model_id})
+                response = await provider.embed(routed)
+                return response.model_copy(update={"model": config.name})
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "router.embed_failed",
+                    model=config.name,
+                    provider=provider.provider_name,
+                    error=str(exc),
+                    has_fallback=config.fallback_model is not None,
+                )
+
+        raise ProviderError(model_name, last_exc)  # type: ignore[arg-type]
 
     # ── Provider factory ─────────────────────────────────────────────────
 
@@ -190,6 +309,10 @@ class ModelRouter:
         raise ValueError(f"Unknown provider type: {provider_type}")
 
     # ── Public accessors ─────────────────────────────────────────────────
+
+    @property
+    def registry(self) -> ModelRegistry:
+        return self._registry
 
     @property
     def providers(self) -> dict[str, Provider]:
