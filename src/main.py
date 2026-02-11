@@ -87,9 +87,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     # ── Register routers ────────────────────────────────────────────────
-    # (will be added as we build each API module)
-    # from src.api.chat import router as chat_router
-    # app.include_router(chat_router, prefix="/v1")
+
+    from src.api.chat import router as chat_router
+
+    app.include_router(chat_router, prefix="/v1")
 
     return app
 
